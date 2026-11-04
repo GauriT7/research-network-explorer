@@ -2,558 +2,1288 @@
 import streamlit as st
 import networkx as nx
 import streamlit.components.v1 as components
-import pandas as pd
 import json
+import re
+import hashlib
+import requests
+import fitz
+import tempfile
 import os
 from pyvis.network import Network
-from pypdf import PdfReader
 from openai import OpenAI
+from neo4j import GraphDatabase
+from urllib.parse import quote
 
-# ─────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────
+# ============================================================
+# CONFIG
+# ============================================================
 
 st.set_page_config(
     page_title="Research Nexus",
-    page_icon="🕸️",
-    layout="wide"
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
 .stApp {
-    background-color: #0b1020;
+    background: #0b1020;
     color: #e8eaf0;
 }
 [data-testid="stSidebar"] {
-    background-color: #121a2c;
+    background: #121a2c;
 }
 h1, h2, h3 {
     color: #dce6ff !important;
 }
 .stTextInput input, .stTextArea textarea {
-    background-color: #182238;
-    color: #ffffff;
+    background: #182238;
+    color: white;
+}
+div[data-testid="stMetric"] {
+    background: #182238;
+    padding: 15px;
+    border-radius: 12px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────
-# SESSION DATABASE
-# ─────────────────────────────────────────
+
+# ============================================================
+# SECRETS / CONNECTIONS
+# ============================================================
+
+def get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+NEO4J_URI = get_secret("NEO4J_URI")
+NEO4J_USERNAME = get_secret("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = get_secret("NEO4J_PASSWORD")
+OPENALEX_EMAIL = get_secret("OPENALEX_EMAIL", "")
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+# ============================================================
+# NEO4J DATABASE
+# ============================================================
+
+@st.cache_resource
+def get_driver():
+    if not NEO4J_URI or not NEO4J_PASSWORD:
+        return None
+
+    return GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+    )
+
+
+driver = get_driver()
+
+
+def init_database():
+    if driver:
+        with driver.session() as session:
+            session.run("""
+                CREATE CONSTRAINT entity_id IF NOT EXISTS
+                FOR (n:Entity)
+                REQUIRE n.id IS UNIQUE
+            """)
+
+
+def save_entity(node):
+    if not driver:
+        return
+
+    with driver.session() as session:
+        session.run("""
+            MERGE (n:Entity {id: $id})
+            SET n.name = $name,
+                n.type = $type,
+                n.description = $description,
+                n.updated = datetime()
+            """,
+            id=node["id"],
+            name=node["name"],
+            type=node["type"],
+            description=node.get("description", "")
+        )
+
+
+def save_relationship(edge):
+    if not driver:
+        return
+
+    with driver.session() as session:
+        session.run("""
+            MATCH (a:Entity {id: $source})
+            MATCH (b:Entity {id: $target})
+            MERGE (a)-[r:RELATED {type: $relationship}]->(b)
+            SET r.source_document = $document,
+                r.evidence = $evidence,
+                r.updated = datetime()
+            """,
+            source=edge["source"],
+            target=edge["target"],
+            relationship=edge["relationship"],
+            document=edge.get("document", ""),
+            evidence=edge.get("evidence", "")
+        )
+
+
+def load_graph():
+    G = nx.Graph()
+
+    if not driver:
+        return G
+
+    with driver.session() as session:
+
+        nodes = session.run("""
+            MATCH (n:Entity)
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.type AS type,
+                   n.description AS description
+        """)
+
+        for record in nodes:
+            G.add_node(
+                record["id"],
+                name=record["name"],
+                type=record["type"],
+                description=record["description"] or ""
+            )
+
+        edges = session.run("""
+            MATCH (a:Entity)-[r:RELATED]->(b:Entity)
+            RETURN a.id AS source,
+                   b.id AS target,
+                   r.type AS relationship,
+                   r.evidence AS evidence,
+                   r.source_document AS document
+        """)
+
+        for record in edges:
+            G.add_edge(
+                record["source"],
+                record["target"],
+                relationship=record["relationship"],
+                evidence=record["evidence"] or "",
+                document=record["document"] or ""
+            )
+
+    return G
+
+
+init_database()
+
+
+# ============================================================
+# ENTITY NORMALIZATION
+# ============================================================
+
+def normalize_name(name):
+    name = name.lower().strip()
+    name = re.sub(r"^(dr|prof|professor)\.?\s+", "", name)
+    name = re.sub(r"[^\w\s]", "", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+def make_entity_id(name, entity_type):
+    normalized = normalize_name(name)
+    return f"{entity_type.lower()}::{normalized}"
+
+
+# ============================================================
+# GRAPH MANAGEMENT
+# ============================================================
 
 if "graph" not in st.session_state:
-    st.session_state.graph = nx.Graph()
+    st.session_state.graph = load_graph()
 
 if "documents" not in st.session_state:
     st.session_state.documents = []
 
+if "selected_entity" not in st.session_state:
+    st.session_state.selected_entity = None
+
 G = st.session_state.graph
 
-# ─────────────────────────────────────────
-# AI EXTRACTION
-# ─────────────────────────────────────────
 
-def extract_entities(text):
-    api_key = st.session_state.get("api_key", "")
+def add_entity(name, entity_type, description=""):
+    entity_id = make_entity_id(name, entity_type)
 
-    if not api_key:
+    if entity_id in G:
+        old = G.nodes[entity_id].get("description", "")
+        description = description or old
+
+    G.add_node(
+        entity_id,
+        name=name,
+        type=entity_type,
+        description=description
+    )
+
+    save_entity({
+        "id": entity_id,
+        "name": name,
+        "type": entity_type,
+        "description": description
+    })
+
+    return entity_id
+
+
+def add_relationship(source, target, relationship,
+                   evidence="", document=""):
+
+    if source not in G or target not in G:
+        return
+
+    G.add_edge(
+        source,
+        target,
+        relationship=relationship,
+        evidence=evidence,
+        document=document
+    )
+
+    save_relationship({
+        "source": source,
+        "target": target,
+        "relationship": relationship,
+        "evidence": evidence,
+        "document": document
+    })
+
+
+def get_entity_by_name(name):
+    normalized = normalize_name(name)
+
+    for node, attrs in G.nodes(data=True):
+        if normalize_name(attrs.get("name", node)) == normalized:
+            return node
+
+    return None
+
+
+# ============================================================
+# DOCUMENT EXTRACTION
+# ============================================================
+
+def extract_pdf_text(file):
+    document = fitz.open(stream=file.read(), filetype="pdf")
+
+    pages = []
+
+    for page in document:
+        pages.append(page.get_text("text"))
+
+    return "\n".join(pages)
+
+
+def extract_image_text(file):
+    if not client:
+        return ""
+
+    import base64
+
+    encoded = base64.b64encode(file.getvalue()).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract all readable text from this image. "
+                            "Preserve names, institutional affiliations, "
+                            "titles, and publication details. "
+                            "Return plain text only."
+                        )
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{file.type};base64,{encoded}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=4000
+    )
+
+    return response.choices[0].message.content
+
+
+# ============================================================
+# AI STRUCTURED KNOWLEDGE EXTRACTION
+# ============================================================
+
+def extract_knowledge(text, filename):
+
+    if not client:
+        st.error("OpenAI API key is missing.")
         return None
 
-    client = OpenAI(api_key=api_key)
+    instructions = """
+You are a scientific research intelligence extraction system.
 
-    prompt = f"""
-Analyze the following research document.
+Extract entities and relationships explicitly supported by the document.
 
-Extract:
-1. People
-2. Universities
-3. Hospitals
-4. Research institutes
-5. Organisations
-6. Publications
-7. Research fields
-8. Relationships between entities
+ENTITY TYPES:
+Person
+Institution
+Organisation
+Publication
+ResearchField
+Conference
+ClinicalTrial
+Grant
 
-Return ONLY valid JSON in this format:
+RELATIONSHIPS:
+educated_at
+employed_at
+affiliated_with
+holds_chair_at
+founded
+co_authored
+authored
+mentored_by
+collaborated_with
+member_of
+presented_at
+funded_by
+conducts_research_in
+cited
+participated_in
 
-{{
+RULES:
+- Extract full names whenever available.
+- Distinguish institutions from departments.
+- Include past and present affiliations if stated.
+- Never invent mentorship or personal relationships.
+- Shared affiliation is NOT proof of collaboration.
+- Extract only evidence-supported relationships.
+- Include a brief evidence excerpt for each relationship.
+- Use consistent entity names.
+- If the document contains a list of authors, extract all authors.
+- Use null or empty values for unknown details.
+
+Return valid JSON in this exact structure:
+
+{
   "nodes": [
-    {{
-      "id": "unique entity name",
-      "type": "Person | Institution | Publication | ResearchField",
-      "description": "brief description"
-    }}
+    {
+      "name": "Full entity name",
+      "type": "Person",
+      "description": "Brief factual description"
+    }
   ],
   "edges": [
-    {{
-      "source": "entity A",
-      "target": "entity B",
-      "relationship": "educated_at | employed_at | authored | affiliated_with | researches"
-    }}
+    {
+      "source": "Entity A",
+      "target": "Entity B",
+      "relationship": "co_authored",
+      "evidence": "Evidence from the document"
+    }
   ]
-}}
-
-Document:
-{text[:18000]}
+}
 """
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
+        messages=[
+            {
+                "role": "system",
+                "content": instructions
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Source document: {filename}\n\n"
+                    f"DOCUMENT CONTENT:\n{text[:30000]}"
+                )
+            }
+        ],
+        response_format={"type": "json_object"},
+        temperature=0
     )
 
-    return json.loads(response.choices[0].message.content)
+    return json.loads(
+        response.choices[0].message.content
+    )
 
 
-def add_to_graph(data):
-    for node in data.get("nodes", []):
-        G.add_node(
-            node["id"],
-            type=node.get("type", "Unknown"),
-            description=node.get("description", "")
+# ============================================================
+# INGEST AND RECONCILE
+# ============================================================
+
+def ingest_knowledge(data, filename):
+
+    name_to_id = {}
+
+    # 1. Create / resolve nodes
+    for item in data.get("nodes", []):
+
+        name = item.get("name", "").strip()
+        entity_type = item.get("type", "Unknown")
+
+        if not name:
+            continue
+
+        existing = get_entity_by_name(name)
+
+        if existing:
+            entity_id = existing
+
+            # Preserve existing descriptions when new data is blank.
+            old_description = G.nodes[existing].get(
+                "description", ""
+            )
+
+            description = (
+                item.get("description", "")
+                or old_description
+            )
+
+            G.nodes[existing]["description"] = description
+
+        else:
+            entity_id = add_entity(
+                name,
+                entity_type,
+                item.get("description", "")
+            )
+
+        name_to_id[name] = entity_id
+
+    # 2. Resolve edges
+    for edge in data.get("edges", []):
+
+        source_name = edge.get("source", "")
+        target_name = edge.get("target", "")
+
+        source = (
+            name_to_id.get(source_name)
+            or get_entity_by_name(source_name)
         )
 
-    for edge in data.get("edges", []):
-        source = edge["source"]
-        target = edge["target"]
+        target = (
+            name_to_id.get(target_name)
+            or get_entity_by_name(target_name)
+        )
 
-        if source not in G:
-            G.add_node(source, type="Unknown")
+        if source and target and source != target:
 
-        if target not in G:
-            G.add_node(target, type="Unknown")
+            add_relationship(
+                source,
+                target,
+                edge.get("relationship", "connected"),
+                edge.get("evidence", ""),
+                filename
+            )
 
-        G.add_edge(
+
+# ============================================================
+# EXTERNAL RESEARCH ENRICHMENT
+# ============================================================
+
+def search_openalex(name):
+
+    try:
+        params = {
+            "search": name,
+            "per-page": 5
+        }
+
+        if OPENALEX_EMAIL:
+            params["mailto"] = OPENALEX_EMAIL
+
+        response = requests.get(
+            "https://api.openalex.org/authors",
+            params=params,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        results = response.json().get("results", [])
+
+        return [
+            {
+                "name": author.get("display_name"),
+                "works_count": author.get("works_count"),
+                "cited_by_count": author.get("cited_by_count"),
+                "id": author.get("id"),
+                "orcid": author.get("orcid"),
+                "affiliations": [
+                    item.get("institution", {}).get("display_name")
+                    for item in author.get("affiliations", [])
+                    if item.get("institution")
+                ]
+            }
+            for author in results
+        ]
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def search_pubmed(name):
+
+    try:
+        response = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={
+                "db": "pubmed",
+                "term": f"{name}[Author]",
+                "retmax": 10,
+                "retmode": "json"
+            },
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        return response.json().get(
+            "esearchresult", {}
+        ).get("idlist", [])
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# GRAPH VISUALIZATION
+# ============================================================
+
+def render_graph(graph, focus=None, physics=True):
+
+    net = Network(
+        height="760px",
+        width="100%",
+        bgcolor="#0b1020",
+        font_color="#e8eaf0",
+        cdn_resources="in_line",
+        select_menu=False,
+        filter_menu=False
+    )
+
+    colors = {
+        "Person": "#73b9ff",
+        "Institution": "#a29bfe",
+        "Organisation": "#fd79a8",
+        "Publication": "#55efc4",
+        "ResearchField": "#ffeaa7",
+        "Conference": "#fab1a0",
+        "ClinicalTrial": "#81ecec",
+        "Grant": "#fdcb6e",
+        "Unknown": "#b2bec3"
+    }
+
+    visible_nodes = set(graph.nodes)
+
+    # When focusing, show the selected node and its neighbors.
+    if focus and focus in graph:
+        visible_nodes = {focus} | set(graph.neighbors(focus))
+
+    for node in visible_nodes:
+
+        attrs = graph.nodes[node]
+        entity_type = attrs.get("type", "Unknown")
+        name = attrs.get("name", node)
+
+        color = colors.get(entity_type, "#b2bec3")
+
+        if focus == node:
+            color = "#ff7675"
+
+        net.add_node(
+            node,
+            label=name,
+            title=(
+                f"{name}\n"
+                f"Type: {entity_type}\n"
+                f"{attrs.get('description', '')}"
+            ),
+            color=color,
+            size=30 if entity_type == "Person" else 20,
+            font={"size": 16, "face": "Arial"},
+            borderWidth=2
+        )
+
+    for source, target, attrs in graph.edges(data=True):
+
+        if source not in visible_nodes or target not in visible_nodes:
+            continue
+
+        relationship = attrs.get(
+            "relationship", "connected"
+        )
+
+        net.add_edge(
             source,
             target,
-            relationship=edge.get("relationship", "connected")
+            title=relationship,
+            label=relationship.replace("_", " "),
+            color="#52617a",
+            width=1.5,
+            font={"size": 10, "color": "#aab8cc"}
         )
 
+    net.set_options("""
+    var options = {
+      "nodes": {
+        "shape": "dot",
+        "scaling": {"min": 12, "max": 35}
+      },
+      "edges": {
+        "smooth": {"type": "continuous"},
+        "font": {
+          "size": 10,
+          "background": "#0b1020",
+          "strokeWidth": 0
+        }
+      },
+      "physics": {
+        "enabled": true,
+        "barnesHut": {
+          "gravitationalConstant": -4500,
+          "centralGravity": 0.2,
+          "springLength": 180,
+          "springConstant": 0.035,
+          "damping": 0.12
+        },
+        "stabilization": {
+          "enabled": true,
+          "iterations": 250
+        }
+      },
+      "interaction": {
+        "hover": true,
+        "navigationButtons": true,
+        "keyboard": true,
+        "multiselect": true,
+        "tooltipDelay": 200
+      }
+    }
+    """)
 
-# ─────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────
+    if not physics:
+        net.toggle_physics(False)
 
-st.sidebar.title("🕸️ Research Nexus")
+    return net.generate_html()
+
+
+# ============================================================
+# SIDEBAR NAVIGATION
+# ============================================================
+
+st.sidebar.title("🧬 Research Nexus")
 
 page = st.sidebar.radio(
-    "Navigate",
-    ["Network Explorer", "Add Research", "People Directory", "Settings"]
+    "Explore",
+    [
+        "Network",
+        "Researcher Profiles",
+        "Upload & Ingest",
+        "Discover Researchers",
+        "Manage Database"
+    ]
 )
 
-st.sidebar.markdown("---")
-st.sidebar.metric("Entities", G.number_of_nodes())
-st.sidebar.metric("Connections", G.number_of_edges())
+st.sidebar.divider()
 
-# ─────────────────────────────────────────
-# NETWORK EXPLORER
-# ─────────────────────────────────────────
+st.sidebar.metric("Total Entities", G.number_of_nodes())
+st.sidebar.metric("Relationships", G.number_of_edges())
 
-if page == "Network Explorer":
+if driver:
+    st.sidebar.success("Database connected")
+else:
+    st.sidebar.warning("Database not configured")
 
-    st.title("Research Network")
+
+# ============================================================
+# MAIN: NETWORK
+# ============================================================
+
+if page == "Network":
+
+    st.title("🕸️ The Research Universe")
+
     st.caption(
-        "Explore the interconnected world of researchers, "
-        "institutions, and scientific discoveries."
+        "A living map of researchers, institutions, "
+        "scientific discoveries, and collaborations."
     )
 
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric("Researchers", sum(
+        1 for _, a in G.nodes(data=True)
+        if a.get("type") == "Person"
+    ))
+
+    c2.metric("Institutions", sum(
+        1 for _, a in G.nodes(data=True)
+        if a.get("type") in ["Institution", "Organisation"]
+    ))
+
+    c3.metric("Publications", sum(
+        1 for _, a in G.nodes(data=True)
+        if a.get("type") == "Publication"
+    ))
+
     if G.number_of_nodes() == 0:
+
         st.info(
-            "Your network is empty. Upload a research paper "
-            "or add researchers to begin building your graph."
+            "Your knowledge graph is empty. "
+            "Start by uploading research papers."
         )
 
     else:
+
         search = st.text_input(
-            "🔍 Find a person, institution, or research topic"
+            "Search the universe",
+            placeholder=(
+                "Type a researcher, hospital, university, "
+                "publication, or field..."
+            )
         )
 
-        selected_node = None
+        matching_nodes = []
 
         if search:
-            matches = [
-                node for node in G.nodes
-                if search.lower() in node.lower()
+            matching_nodes = [
+                node for node, attrs in G.nodes(data=True)
+                if search.lower() in (
+                    attrs.get("name", node).lower()
+                )
             ]
 
-            if matches:
-                selected_node = st.selectbox(
-                    "Select a matching entity",
-                    matches
-                )
+        selected = None
 
-        # Graph controls
-        col1, col2 = st.columns(2)
-
-        with col1:
-            physics = st.toggle("Enable network physics", True)
-
-        with col2:
-            show_labels = st.toggle("Show all labels", True)
-
-        net = Network(
-            height="720px",
-            width="100%",
-            bgcolor="#0b1020",
-            font_color="#e8eaf0",
-            notebook=False,
-            directed=False
-        )
-
-        net.barnes_hut(
-            gravity=-3000,
-            central_gravity=0.3,
-            spring_length=160,
-            spring_strength=0.04,
-            damping=0.09
-        )
-
-        color_map = {
-            "Person": "#74b9ff",
-            "Institution": "#a29bfe",
-            "Publication": "#55efc4",
-            "ResearchField": "#ffeaa7",
-            "Organisation": "#fd79a8",
-            "Unknown": "#b2bec3"
-        }
-
-        for node, attrs in G.nodes(data=True):
-
-            node_type = attrs.get("type", "Unknown")
-            node_color = color_map.get(node_type, "#b2bec3")
-
-            if selected_node == node:
-                node_color = "#ff7675"
-
-            net.add_node(
-                node,
-                label=node if show_labels else "",
-                title=attrs.get("description", node),
-                color=node_color,
-                size=25 if node_type == "Person" else 18,
-                shape="dot"
+        if matching_nodes:
+            selected = st.selectbox(
+                "Select entity to explore",
+                matching_nodes,
+                format_func=lambda x: G.nodes[x].get("name", x)
             )
 
-        for source, target, attrs in G.edges(data=True):
+        show_physics = st.toggle(
+            "Interactive physics",
+            value=True
+        )
 
-            relationship = attrs.get("relationship", "connected")
-
-            net.add_edge(
-                source,
-                target,
-                title=relationship,
-                label=relationship,
-                color="#52617a",
-                font={"size": 10, "color": "#aab8cc"},
-                width=1.5
-            )
-
-        net.set_options("""
-        var options = {
-          "nodes": {
-            "font": {"size": 16, "face": "Inter"},
-            "borderWidth": 1
-          },
-          "edges": {
-            "smooth": {"type": "dynamic"},
-            "color": {"inherit": false}
-          },
-          "physics": {
-            "enabled": true,
-            "barnesHut": {
-              "gravitationalConstant": -3000,
-              "centralGravity": 0.3,
-              "springLength": 160,
-              "springConstant": 0.04,
-              "damping": 0.09
-            },
-            "stabilization": {"iterations": 200}
-          },
-          "interaction": {
-            "hover": true,
-            "navigationButtons": true,
-            "keyboard": true,
-            "multiselect": true
-          }
-        }
-        """)
-
-        html = net.generate_html()
+        html = render_graph(
+            G,
+            focus=selected,
+            physics=show_physics
+        )
 
         components.html(
             html,
-            height=740,
-            scrolling=True
+            height=790,
+            scrolling=False
         )
 
-        if selected_node:
-            st.subheader(f"🔎 {selected_node}")
+        if selected:
 
-            attrs = G.nodes[selected_node]
+            st.markdown("---")
 
-            st.write(
-                attrs.get(
-                    "description",
-                    "No description available yet."
-                )
+            attrs = G.nodes[selected]
+
+            st.header(
+                attrs.get("name", selected)
             )
 
-            st.markdown("**Direct connections**")
+            st.write(
+                attrs.get("description", "No description yet.")
+            )
 
-            neighbors = list(G.neighbors(selected_node))
+            st.subheader("Direct connections")
 
-            for neighbor in neighbors:
-                relationship = G.edges[
-                    selected_node, neighbor
-                ].get("relationship", "connected")
+            for neighbor in G.neighbors(selected):
 
-                st.write(f"↔ {neighbor} — *{relationship}*")
+                edge = G.edges[selected, neighbor]
 
-            if len(neighbors) >= 2:
-                st.markdown("**Connections between your selected entity and others**")
+                st.write(
+                    f"**{G.nodes[neighbor].get('name', neighbor)}** "
+                    f"— {edge.get('relationship', 'connected')}"
+                )
+
+            st.subheader("Explore paths")
+
+            targets = [
+                node for node in G.nodes
+                if node != selected
+            ]
+
+            if targets:
 
                 target = st.selectbox(
-                    "Explore a path to another entity",
-                    [n for n in G.nodes if n != selected_node]
+                    "Find connection to:",
+                    targets,
+                    format_func=lambda x: G.nodes[x].get("name", x)
                 )
 
                 try:
+
                     path = nx.shortest_path(
                         G,
-                        source=selected_node,
-                        target=target
+                        selected,
+                        target
                     )
 
-                    st.success(
-                        " → ".join(path)
-                    )
+                    for i in range(len(path) - 1):
+
+                        a = path[i]
+                        b = path[i + 1]
+
+                        relationship = G.edges[a, b].get(
+                            "relationship", "connected"
+                        )
+
+                        st.markdown(
+                            f"**{G.nodes[a].get('name', a)}** "
+                            f"→ *{relationship}* → "
+                            f"**{G.nodes[b].get('name', b)}**"
+                        )
 
                 except nx.NetworkXNoPath:
-                    st.warning(
-                        "No known connection between these entities yet."
-                    )
 
-# ─────────────────────────────────────────
-# ADD RESEARCH
-# ─────────────────────────────────────────
+                    st.warning("No known path between these entities.")
 
-elif page == "Add Research":
 
-    st.title("📚 Add to your knowledge base")
+# ============================================================
+# RESEARCHER PROFILES
+# ============================================================
 
-    api_key = st.text_input(
-        "OpenAI API key",
-        type="password",
-        value=st.session_state.get("api_key", "")
-    )
+elif page == "Researcher Profiles":
 
-    if api_key:
-        st.session_state.api_key = api_key
+    st.title("👤 Researcher Intelligence")
 
-    st.markdown("### Upload a research paper")
+    people = [
+        node for node, attrs in G.nodes(data=True)
+        if attrs.get("type") == "Person"
+    ]
 
-    uploaded_file = st.file_uploader(
-        "PDF document",
-        type=["pdf"]
-    )
+    if not people:
 
-    if uploaded_file and st.button("Extract & map connections"):
-
-        with st.spinner("Reading document and extracting entities..."):
-
-            reader = PdfReader(uploaded_file)
-
-            text = "\n".join(
-                page.extract_text() or ""
-                for page in reader.pages
-            )
-
-            result = extract_entities(text)
-
-            if result:
-                add_to_graph(result)
-
-                st.session_state.documents.append(
-                    uploaded_file.name
-                )
-
-                st.success(
-                    f"Added {len(result['nodes'])} entities "
-                    f"and {len(result['edges'])} connections!"
-                )
-
-                st.json(result)
-
-            else:
-                st.error(
-                    "Please add your OpenAI API key in Settings."
-                )
-
-    st.markdown("---")
-    st.markdown("### Add a person or institution manually")
-
-    with st.form("manual_entry"):
-
-        entity_name = st.text_input("Name")
-        entity_type = st.selectbox(
-            "Entity type",
-            [
-                "Person",
-                "Institution",
-                "Organisation",
-                "Publication",
-                "ResearchField"
-            ]
-        )
-
-        description = st.text_area(
-            "Description, position, research interests..."
-        )
-
-        submitted = st.form_submit_button(
-            "Add to network"
-        )
-
-        if submitted and entity_name:
-
-            G.add_node(
-                entity_name,
-                type=entity_type,
-                description=description
-            )
-
-            st.success(f"Added {entity_name} to the graph!")
-
-    st.markdown("### Connect two entities")
-
-    with st.form("connect_entities"):
-
-        nodes = list(G.nodes)
-
-        if len(nodes) >= 2:
-
-            source = st.selectbox(
-                "First entity",
-                nodes
-            )
-
-            target = st.selectbox(
-                "Second entity",
-                [n for n in nodes if n != source]
-            )
-
-            relationship = st.selectbox(
-                "Relationship",
-                [
-                    "co_authored",
-                    "educated_at",
-                    "employed_at",
-                    "mentored_by",
-                    "collaborated_with",
-                    "affiliated_with",
-                    "holds_chair_at",
-                    "researched"
-                ]
-            )
-
-            connect = st.form_submit_button(
-                "Connect entities"
-            )
-
-            if connect:
-
-                G.add_edge(
-                    source,
-                    target,
-                    relationship=relationship
-                )
-
-                st.success("Connection added!")
-
-        else:
-            st.caption("Add at least two entities first.")
-
-# ─────────────────────────────────────────
-# PEOPLE DIRECTORY
-# ─────────────────────────────────────────
-
-elif page == "People Directory":
-
-    st.title("👥 People & Organisations")
-
-    if G.number_of_nodes() > 0:
-
-        df = pd.DataFrame([
-            {
-                "Name": node,
-                "Type": attrs.get("type", "Unknown"),
-                "Description": attrs.get("description", ""),
-                "Connections": G.degree(node)
-            }
-            for node, attrs in G.nodes(data=True)
-        ])
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv = df.to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            "Download directory as CSV",
-            csv,
-            "research_directory.csv",
-            "text/csv"
-        )
+        st.info("Upload research papers to populate researcher profiles.")
 
     else:
-        st.info("Your directory is empty.")
 
-# ─────────────────────────────────────────
-# SETTINGS
-# ─────────────────────────────────────────
+        selected_person = st.selectbox(
+            "Select a researcher",
+            people,
+            format_func=lambda x: G.nodes[x].get("name", x)
+        )
 
-elif page == "Settings":
+        attrs = G.nodes[selected_person]
 
-    st.title("⚙️ Settings")
+        st.header(attrs.get("name", selected_person))
+        st.write(attrs.get("description", ""))
 
-    st.markdown("### Export your entire network")
+        connections = list(G.neighbors(selected_person))
+
+        st.metric("Network connections", len(connections))
+
+        st.subheader("Academic network")
+
+        for neighbor in connections:
+
+            relationship = G.edges[
+                selected_person, neighbor
+            ].get("relationship", "connected")
+
+            neighbor_attrs = G.nodes[neighbor]
+
+            st.markdown(
+                f"**{neighbor_attrs.get('name', neighbor)}** "
+                f"({neighbor_attrs.get('type', 'Unknown')}) "
+                f"— *{relationship}*"
+            )
+
+        st.subheader("External profile enrichment")
+
+        if st.button("Search OpenAlex + PubMed"):
+
+            name = attrs.get("name", selected_person)
+
+            with st.spinner("Searching scholarly databases..."):
+
+                openalex = search_openalex(name)
+                pubmed = search_pubmed(name)
+
+            st.markdown("### OpenAlex")
+            st.json(openalex)
+
+            st.markdown("### PubMed publication IDs")
+            st.json(pubmed)
+
+
+# ============================================================
+# UPLOAD AND INGEST
+# ============================================================
+
+elif page == "Upload & Ingest":
+
+    st.title("📥 Feed the Research Engine")
+
+    st.markdown(
+        "Upload PDFs, screenshots, or images. "
+        "AI extracts the knowledge and connects it to your existing graph."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Select documents",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files and st.button("🧠 Extract & integrate"):
+
+        if not client:
+
+            st.error(
+                "OpenAI API key is missing. "
+                "Configure it in Streamlit Secrets."
+            )
+
+        else:
+
+            progress = st.progress(0)
+
+            for i, file in enumerate(uploaded_files):
+
+                with st.spinner(f"Processing {file.name}..."):
+
+                    try:
+
+                        if file.type == "application/pdf":
+
+                            text = extract_pdf_text(file)
+
+                        else:
+
+                            text = extract_image_text(file)
+
+                        if not text.strip():
+
+                            st.warning(
+                                f"No readable text in {file.name}"
+                            )
+                            continue
+
+                        knowledge = extract_knowledge(
+                            text,
+                            file.name
+                        )
+
+                        if knowledge:
+
+                            ingest_knowledge(
+                                knowledge,
+                                file.name
+                            )
+
+                            st.success(
+                                f"Integrated {file.name}: "
+                                f"{len(knowledge.get('nodes', []))} entities, "
+                                f"{len(knowledge.get('edges', []))} relationships"
+                            )
+
+                            with st.expander("View extracted information"):
+
+                                st.json(knowledge)
+
+                    except Exception as e:
+
+                        st.error(
+                            f"Error processing {file.name}: {e}"
+                        )
+
+                progress.progress(
+                    (i + 1) / len(uploaded_files)
+                )
+
+            st.success("Ingestion complete!")
+            st.rerun()
+
+    st.divider()
+
+    st.subheader("Manually add a researcher")
+
+    with st.form("manual_person"):
+
+        person_name = st.text_input("Full name")
+        position = st.text_input("Current position")
+        affiliation = st.text_input("Institution")
+        research = st.text_area("Research interests")
+
+        submitted = st.form_submit_button("Add researcher")
+
+        if submitted and person_name:
+
+            person_id = add_entity(
+                person_name,
+                "Person",
+                f"{position}. Research: {research}"
+            )
+
+            if affiliation:
+
+                inst_id = add_entity(
+                    affiliation,
+                    "Institution"
+                )
+
+                add_relationship(
+                    person_id,
+                    inst_id,
+                    "affiliated_with",
+                    evidence="Manually entered"
+                )
+
+            st.success("Researcher added to your graph!")
+            st.rerun()
+
+
+# ============================================================
+# DISCOVER RESEARCHERS
+# ============================================================
+
+elif page == "Discover Researchers":
+
+    st.title("🔭 Researcher Discovery")
+
+    st.markdown(
+        "Find researchers through OpenAlex scholarly metadata."
+    )
+
+    query = st.text_input(
+        "Research field, institution, or author",
+        placeholder="e.g. reproductive endocrinology, Tata Memorial..."
+    )
+
+    if query and st.button("Search OpenAlex"):
+
+        with st.spinner("Searching OpenAlex..."):
+
+            try:
+
+                params = {
+                    "search": query,
+                    "per-page": 15
+                }
+
+                if OPENALEX_EMAIL:
+                    params["mailto"] = OPENALEX_EMAIL
+
+                response = requests.get(
+                    "https://api.openalex.org/authors",
+                    params=params,
+                    timeout=20
+                )
+
+                response.raise_for_status()
+
+                authors = response.json().get("results", [])
+
+                for author in authors:
+
+                    name = author.get("display_name", "")
+
+                    st.markdown(f"### {name}")
+
+                    st.write(
+                        "Works:", author.get("works_count", 0),
+                        "| Citations:", author.get("cited_by_count", 0)
+                    )
+
+                    st.write("ORCID:", author.get("orcid", "Not listed"))
+
+                    affiliations = [
+                        a.get("institution", {}).get("display_name")
+                        for a in author.get("affiliations", [])
+                        if a.get("institution")
+                    ]
+
+                    if affiliations:
+                        st.write("Affiliations:", ", ".join(affiliations))
+
+                    if st.button(
+                        f"Add {name} to network",
+                        key=f"add_{author.get('id')}"
+                    ):
+
+                        person_id = add_entity(
+                            name,
+                            "Person",
+                            f"OpenAlex profile: {author.get('id')}"
+                        )
+
+                        for affiliation in affiliations:
+
+                            inst_id = add_entity(
+                                affiliation,
+                                "Institution"
+                            )
+
+                            add_relationship(
+                                person_id,
+                                inst_id,
+                                "affiliated_with",
+                                evidence="OpenAlex affiliation metadata"
+                            )
+
+                        st.success(f"Added {name}!")
+                        st.rerun()
+
+                    st.divider()
+
+            except Exception as e:
+
+                st.error(f"OpenAlex error: {e}")
+
+
+# ============================================================
+# DATABASE MANAGEMENT
+# ============================================================
+
+elif page == "Manage Database":
+
+    st.title("🗄️ Knowledge Base Management")
+
+    st.subheader("Export your graph")
 
     if G.number_of_nodes() > 0:
 
-        data = nx.node_link_data(G)
+        export_data = nx.node_link_data(G)
 
         st.download_button(
-            "Download graph as JSON",
-            json.dumps(data, indent=2),
-            "research_network.json",
+            "Download JSON backup",
+            json.dumps(export_data, indent=2),
+            "research_nexus_backup.json",
             "application/json"
         )
 
-    st.markdown("### Import an existing network")
+        node_rows = []
 
-    uploaded_json = st.file_uploader(
-        "Upload JSON network",
+        for node, attrs in G.nodes(data=True):
+
+            node_rows.append({
+                "ID": node,
+                "Name": attrs.get("name", node),
+                "Type": attrs.get("type", ""),
+                "Description": attrs.get("description", "")
+            })
+
+        st.download_button(
+            "Download entities CSV",
+            __import__("pandas").DataFrame(
+                node_rows
+            ).to_csv(index=False),
+            "research_entities.csv"
+        )
+
+    st.divider()
+
+    st.subheader("Import a previous graph")
+
+    backup = st.file_uploader(
+        "Upload JSON backup",
         type=["json"]
     )
 
-    if uploaded_json and st.button("Import network"):
+    if backup and st.button("Import graph"):
 
-        data = json.load(uploaded_json)
+        data = json.load(backup)
 
         imported = nx.node_link_graph(
             data,
             edges="links"
         )
 
-        st.session_state.graph = imported
+        for node, attrs in imported.nodes(data=True):
 
-        st.success("Network imported successfully!")
+            add_entity(
+                attrs.get("name", node),
+                attrs.get("type", "Unknown"),
+                attrs.get("description", "")
+            )
 
-    st.caption(
-        "Research Nexus · Personal Research Intelligence"
+        for source, target, attrs in imported.edges(data=True):
+
+            source_name = imported.nodes[source].get(
+                "name", source
+            )
+
+            target_name = imported.nodes[target].get(
+                "name", target
+            )
+
+            a = get_entity_by_name(source_name)
+            b = get_entity_by_name(target_name)
+
+            if a and b:
+
+                add_relationship(
+                    a,
+                    b,
+                    attrs.get("relationship", "connected"),
+                    attrs.get("evidence", ""),
+                    attrs.get("document", "Imported backup")
+                )
+
+        st.success("Import complete!")
+        st.rerun()
+
+    st.divider()
+
+    st.subheader("Danger zone")
+
+    st.warning(
+        "Deleting the graph removes your persistent database data."
     )
+
+    confirm_delete = st.checkbox(
+        "I understand and want to clear the database"
+    )
+
+    if confirm_delete and st.button("Delete all graph data"):
+
+        if driver:
+
+            with driver.session() as session:
+                session.run("""
+                    MATCH (n:Entity)
+                    DETACH DELETE n
+                """)
+
+        st.session_state.graph = nx.Graph()
+        st.success("Database cleared.")
+        st.rerun()
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.sidebar.caption(
+    "Research Nexus · Built for curiosity."
+)
