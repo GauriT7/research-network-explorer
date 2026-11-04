@@ -54,11 +54,10 @@ div[data-testid="stMetric"] {
 # SECRETS / CONNECTIONS
 # ============================================================
 
+import os
+
 def get_secret(key, default=""):
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
+    return os.getenv(key) or st.secrets.get(key, default)
 
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
