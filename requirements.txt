@@ -1,6 +1,9 @@
-streamlit
-networkx
-pyvis
-pypdf
-openai
-pandas
+
+streamlit>=1.40.0
+networkx>=3.2
+pyvis>=0.3.2
+openai>=1.60.0
+neo4j>=5.28.0
+pymupdf>=1.25.0
+requests>=2.32.0
+pandas>=2.2.0
