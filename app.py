@@ -86,6 +86,15 @@ def get_driver():
 
 
 driver = get_driver()
+def check_database_connection():
+    if driver is None:
+        return False
+    try:
+        driver.verify_connectivity()
+        return True
+    except Exception as e:
+        st.error(f"Neo4j connection failed: {e}")
+        return False
 
 
 def init_database():
