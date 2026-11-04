@@ -721,9 +721,14 @@ st.sidebar.metric("Total Entities", G.number_of_nodes())
 st.sidebar.metric("Relationships", G.number_of_edges())
 
 if driver:
-    st.sidebar.success("Database connected")
+    try:
+        driver.verify_connectivity()
+        st.sidebar.success("Database connected")
+    except Exception as e:
+        st.sidebar.error("Neo4j connection failed")
+        st.sidebar.caption(str(e))
 else:
-    st.sidebar.warning("Database not configured")
+    st.sidebar.warning("Database credentials missing")
 
 
 # ============================================================
